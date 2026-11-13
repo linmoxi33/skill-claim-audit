@@ -34,7 +34,7 @@ It does **not** install packages, execute skill scripts, check network endpoints
 Python 3.8+, no third-party packages, no network.
 
 ```bash
-git clone git@github-linmoxi33:linmoxi33/skill-claim-audit.git
+git clone https://github.com/linmoxi33/skill-claim-audit.git
 cd skill-claim-audit
 python3 bin/skill-claim-audit examples/in/demo-skill --fail-on medium
 ```
