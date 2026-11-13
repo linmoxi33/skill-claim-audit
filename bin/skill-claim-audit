@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""skill-claim-audit: check environment claims in SKILL.md files against in-repo evidence.
+
+Offline, zero-dependency. Rules:
+  CLAIM001  "X is preinstalled/bundled" but X is not declared in any dependency manifest.
+  CLAIM002  "X is auto-configured" via a repo script, but that script never locates X.
+  CLAIM003  A repo-relative path referenced by the skill does not exist.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+
+SEV_ORDER = {"low": 1, "medium": 2, "high": 3}
+PREINSTALLED_RE = re.compile(
+    r"\b(preinstalled|pre-installed|ships with|bundled with|comes? (?:pre)?installed)\b", re.I
+)
+AUTOCONF_RE = re.compile(r"\b(auto-?configured|automatically configured|pre-?configured)\b", re.I)
+BACKTICK_RE = re.compile(r"`([^`\n]+)`")
+PATH_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+(?:\.[A-Za-z0-9]+)?$")
+PACKAGE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{1,40}$")
+LOCATOR_RE = re.compile(
+    r"(shutil\.which|command -v|\bwhich\s+[A-Za-z0-9_.-]+|/Applications/|Program Files|os\.path\.exists)", re.I
+)
+MANIFEST_NAMES = ("requirements.txt", "pyproject.toml", "package.json", "environment.yml", "setup.py", "Pipfile")
+SKIP_TOKENS = {
+    "pip", "install", "python", "python3", "import", "only", "if", "or", "and", "the", "a", "an",
+    "scripts", "references", "assets", "template", "templates", "docs", "examples", "run", "use",
+}
+
+
+def read_text(path):
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        return fh.read()
+
+
+def split_frontmatter(text):
+    if not text.startswith("---\n"):
+        return {}, text
+    end = text.find("\n---", 3)
+    if end == -1:
+        return {}, text
+    meta = {}
+    for line in text[4:end].splitlines():
+        if ":" in line and not line.startswith((" ", "\t")):
+            key, val = line.split(":", 1)
+            meta[key.strip()] = val.strip().strip('"').strip("'")
+    return meta, text[end + 4:]
+
+
+def find_skills(root):
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in {".git", "node_modules", "__pycache__", ".venv"})
+        if "SKILL.md" in filenames:
+            found.append(os.path.join(dirpath, "SKILL.md"))
+    return sorted(found)
+
+
+def manifest_packages(root):
+    names, files = set(), []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in {".git", "node_modules", "__pycache__", ".venv"}]
+        for fn in filenames:
+            if fn not in MANIFEST_NAMES:
+                continue
+            path = os.path.join(dirpath, fn)
+            files.append(os.path.relpath(path, root))
+            text = read_text(path)
+            if fn == "package.json":
+                try:
+                    data = json.loads(text)
+                    for key in ("dependencies", "devDependencies", "peerDependencies"):
+                        names.update((data.get(key) or {}).keys())
+                except (ValueError, AttributeError):
+                    pass
+            elif fn == "requirements.txt":
+                for line in text.splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#") or line.startswith("-"):
+                        continue
+                    m = re.match(r"([A-Za-z0-9_.-]+)", line)
+                    if m:
+                        names.add(m.group(1).lower())
+            else:
+                for m in re.finditer(r"[\"']([A-Za-z0-9_.-]+)\s*(?:[<>=!~\[]|[\"'])", text):
+                    names.add(m.group(1).lower())
+    return names, sorted(set(files))
+
+
+def normalize_pkg(name):
+    return name.lower().replace("_", "-")
+
+
+def is_path_token(tok):
+    return "/" in tok and not tok.startswith(("/", "http", "~")) and not any(c in tok for c in "*{}<>|$ ")
+
+
+def add(findings, **kw):
+    findings.append(kw)
+
+
+def extract_claims(skill_path, root, manifests):
+    text = read_text(skill_path)
+    rel = os.path.relpath(skill_path, root)
+    findings = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        tokens = [t.strip() for t in BACKTICK_RE.findall(line)]
+        pm = PREINSTALLED_RE.search(line)
+        if pm:
+            for tok in [t.strip() for t in BACKTICK_RE.findall(line[: pm.end()])]:
+                if not PACKAGE_RE.match(tok) or tok.lower() in SKIP_TOKENS:
+                    continue
+                if any(normalize_pkg(tok) == normalize_pkg(p) for p in manifests):
+                    continue
+                add(
+                    findings, rule="CLAIM001", severity="high", file=rel, line=lineno,
+                    subject=tok, claim=line.strip(),
+                    evidence=("dependency manifests found: " + ", ".join(manifests_files)) if manifests_files
+                    else "no dependency manifest in repository",
+                    message=f"'{tok}' is claimed preinstalled/bundled but is not declared by any dependency manifest",
+                )
+        am = AUTOCONF_RE.search(line)
+        if am:
+            prefix_tokens = [t.strip() for t in BACKTICK_RE.findall(line[: am.start()])]
+            pkg = next((t for t in reversed(prefix_tokens) if PACKAGE_RE.match(t) and t.lower() not in SKIP_TOKENS), None)
+            refs = [t for t in tokens if is_path_token(t)]
+            if pkg:
+                scripts = []
+                for ref in refs:
+                    cand = os.path.normpath(os.path.join(os.path.dirname(skill_path), ref))
+                    if os.path.isfile(cand):
+                        scripts.append(cand)
+                if not scripts:
+                    for dirpath, dirnames, filenames in os.walk(root):
+                        dirnames[:] = [d for d in dirnames if d != ".git"]
+                        for fn in filenames:
+                            if fn.endswith((".sh", ".py", ".js", ".mjs")):
+                                cand = os.path.join(dirpath, fn)
+                                if pkg.lower() in read_text(cand).lower():
+                                    scripts.append(cand)
+                    scripts = scripts[:5]
+                located = False
+                for script in scripts:
+                    body = read_text(script)
+                    if LOCATOR_RE.search(body):
+                        located = True
+                        break
+                if scripts and not located:
+                    add(
+                        findings, rule="CLAIM002", severity="medium", file=rel, line=lineno,
+                        subject=pkg, claim=line.strip(),
+                        evidence="checked: " + ", ".join(os.path.relpath(s, root) for s in scripts),
+                        message=f"'{pkg}' is claimed auto-configured, but the referenced script(s) never locate the binary (no which/command -v/known install path)",
+                    )
+                elif not scripts:
+                    add(
+                        findings, rule="CLAIM002", severity="medium", file=rel, line=lineno,
+                        subject=pkg, claim=line.strip(), evidence="no script under repository mentions it",
+                        message=f"'{pkg}' is claimed auto-configured but no repository file mentions configuring or locating it",
+                    )
+        for tok in tokens:
+            if not is_path_token(tok):
+                continue
+            if not (tok.startswith(("scripts/", "references/", "assets/", "templates/")) or re.search(r"\.[A-Za-z0-9]{1,6}$", tok)):
+                continue
+            cand = os.path.normpath(os.path.join(os.path.dirname(skill_path), tok))
+            if not os.path.exists(cand):
+                add(
+                    findings, rule="CLAIM003", severity="medium", file=rel, line=lineno,
+                    subject=tok, claim=line.strip(), evidence="resolved to: " + os.path.relpath(cand, root),
+                    message=f"referenced path '{tok}' does not exist next to the skill",
+                )
+    # de-duplicate same rule+subject+file (line 16 and 99 in xlsx repeat packages)
+    seen, unique = set(), []
+    for f in findings:
+        key = (f["rule"], f["file"], f["subject"].lower())
+        if key not in seen:
+            seen.add(key)
+            unique.append(f)
+    return unique
+
+
+def scan(root, fail_on="high"):
+    global manifests_files
+    if not os.path.isdir(root):
+        return None, 2
+    skills = find_skills(root)
+    if not skills:
+        return None, 2
+    packages, manifests_files = manifest_packages(root)
+    findings = []
+    for skill in skills:
+        findings.extend(extract_claims(skill, root, packages))
+    findings.sort(key=lambda f: (-SEV_ORDER[f["severity"]], f["file"], f["line"]))
+    counts = {s: sum(1 for f in findings if f["severity"] == s) for s in SEV_ORDER}
+    report = {
+        "root": os.path.abspath(root),
+        "skills_scanned": len(skills),
+        "findings": findings,
+        "summary": {"total": len(findings), **counts, "manifests": manifests_files},
+        "fail_on": fail_on,
+    }
+    threshold = SEV_ORDER[fail_on]
+    report["exit_code"] = 1 if any(SEV_ORDER[f["severity"]] >= threshold for f in findings) else 0
+    return report, report["exit_code"]
+
+
+def render_text(report):
+    lines = [
+        f"root: {report['root']}",
+        f"skills scanned: {report['skills_scanned']}  findings: {report['summary']['total']} "
+        f"(high {report['summary']['high']}, medium {report['summary']['medium']}, low {report['summary']['low']})",
+    ]
+    for f in report["findings"]:
+        lines.append(f"{f['file']}:{f['line']}: {f['severity'].upper()} {f['rule']} {f['subject']} - {f['message']}")
+        lines.append(f"    claim: {f['claim']}")
+        lines.append(f"    evidence: {f['evidence']}")
+    lines.append(f"exit: {report['exit_code']}")
+    return "\n".join(lines)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="skill-claim-audit", description=__doc__)
+    parser.add_argument("root", help="directory containing one or more SKILL.md files")
+    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    parser.add_argument("--fail-on", choices=("low", "medium", "high"), default="high")
+    args = parser.parse_args(argv)
+    report, code = scan(args.root, args.fail_on)
+    if report is None:
+        payload = {"error": "root is not a directory or contains no SKILL.md", "root": args.root}
+        print(json.dumps(payload) if args.json else f"error: {payload['error']}: {args.root}", file=sys.stderr)
+        return 2
+    print(json.dumps(report, indent=2, sort_keys=True) if args.json else render_text(report))
+    return code
+
+
+manifests_files = []
+
+
+if __name__ == "__main__":
+    sys.exit(main())

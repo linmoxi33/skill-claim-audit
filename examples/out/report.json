@@ -1,0 +1,55 @@
+{
+  "exit_code": 1,
+  "fail_on": "medium",
+  "findings": [
+    {
+      "claim": "> `numpy` and `pandas` are preinstalled \u2014 do not install them.",
+      "evidence": "no dependency manifest in repository",
+      "file": "SKILL.md",
+      "line": 6,
+      "message": "'numpy' is claimed preinstalled/bundled but is not declared by any dependency manifest",
+      "rule": "CLAIM001",
+      "severity": "high",
+      "subject": "numpy"
+    },
+    {
+      "claim": "> `numpy` and `pandas` are preinstalled \u2014 do not install them.",
+      "evidence": "no dependency manifest in repository",
+      "file": "SKILL.md",
+      "line": 6,
+      "message": "'pandas' is claimed preinstalled/bundled but is not declared by any dependency manifest",
+      "rule": "CLAIM001",
+      "severity": "high",
+      "subject": "pandas"
+    },
+    {
+      "claim": "`soffice` is auto-configured via `scripts/office.py`.",
+      "evidence": "checked: scripts/office.py",
+      "file": "SKILL.md",
+      "line": 8,
+      "message": "'soffice' is claimed auto-configured, but the referenced script(s) never locate the binary (no which/command -v/known install path)",
+      "rule": "CLAIM002",
+      "severity": "medium",
+      "subject": "soffice"
+    },
+    {
+      "claim": "See `references/missing.md` for details.",
+      "evidence": "resolved to: references/missing.md",
+      "file": "SKILL.md",
+      "line": 10,
+      "message": "referenced path 'references/missing.md' does not exist next to the skill",
+      "rule": "CLAIM003",
+      "severity": "medium",
+      "subject": "references/missing.md"
+    }
+  ],
+  "root": "/home/ubuntu/GitHub/work/trending/skill-claim-audit/examples/in/demo-skill",
+  "skills_scanned": 1,
+  "summary": {
+    "high": 2,
+    "low": 0,
+    "manifests": [],
+    "medium": 2,
+    "total": 4
+  }
+}
